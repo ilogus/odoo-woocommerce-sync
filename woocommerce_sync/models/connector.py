@@ -461,7 +461,9 @@ class WoocommerceSyncConnector(models.Model):
         string="Default WooCommerce package size to 'Unit'", help="If enabled, newly synced WooCommerce products to Odoo will have their package size unit of measure set to 'Unit(s)'.", default=True
     )
     settings_woocommerce_to_odoo_products_delete = fields.Boolean(
-        string='Delete products from Odoo if deleted from WooCommerce?', help='Detects deleted products from WooCommerce and deletes them from Odoo.', default=True
+        string='Delete products from Odoo if deleted from WooCommerce?',
+        help='Detects deleted products from WooCommerce and deletes them from Odoo, or archives them when they cannot be deleted (used in sales or available in an open POS session). Products no longer published in WooCommerce are archived.',
+        default=True,
     )
 
     # WooCommerce to Odoo orders import settings
@@ -1997,23 +1999,41 @@ class WoocommerceSyncConnector(models.Model):
         )
         odoo_products = {odoo_product['woocommerce_id'] for odoo_product in odoo_products}
 
-        # WooCommerce REST API parameters to fetch only IDs
-        params = {'status': 'any', '_fields': 'id'}
+        # WooCommerce REST API parameters to fetch only IDs and statuses
+        params = {'status': 'any', '_fields': 'id,status'}
 
-        # Get all product IDs from WooCommerce
+        # Get all product IDs and statuses from WooCommerce
         woocommerce_products = self.woocommerce_api_get_all_items(woocommerce_api, endpoint='products', params=params)
-        woocommerce_products = {str(woocommerce_product['id']) for woocommerce_product in woocommerce_products}
+        woocommerce_products = {str(woocommerce_product['id']): woocommerce_product.get('status') for woocommerce_product in woocommerce_products}
+
+        # Archive products no longer published in WooCommerce (e.g. set back to draft): the product sync only reads published products, so without this they would stay active in Odoo whenever the 'product.updated' webhook is missed
+        odoo_products_to_archive_statuses = {woocommerce_id: woocommerce_products[woocommerce_id] for woocommerce_id in odoo_products & woocommerce_products.keys() if woocommerce_products[woocommerce_id] != 'publish'}
+        if odoo_products_to_archive_statuses:
+            odoo_products_to_archive = (
+                self.env['product.template'].with_context(lang=False).search([('woocommerce_site_url', '=', self.settings_woocommerce_connection_url), ('woocommerce_id', 'in', list(odoo_products_to_archive_statuses))])
+            )
+            for odoo_product in odoo_products_to_archive:
+                odoo_product.write({'active': False, 'woocommerce_status': odoo_products_to_archive_statuses[odoo_product.woocommerce_id]})
+            _logger.info(f'Archived {len(odoo_products_to_archive)} Odoo products that are no longer published in WooCommerce.')
 
         # Find IDs that exist in Odoo but not in WooCommerce
-        odoo_products_to_delete_ids = odoo_products - woocommerce_products
+        odoo_products_to_delete_ids = odoo_products - woocommerce_products.keys()
 
         if odoo_products_to_delete_ids:
             odoo_products_to_delete = (
                 self.env['product.template'].with_context(lang=False).search([('woocommerce_site_url', '=', self.settings_woocommerce_connection_url), ('woocommerce_id', 'in', list(odoo_products_to_delete_ids))])
             )
-            if odoo_products_to_delete:
-                odoo_products_to_delete.unlink()
-                _logger.info(f'Deleted {len(odoo_products_to_delete)} Odoo products that were no longer found in WooCommerce.')
+            odoo_products_deleted_count = 0
+            for odoo_product in odoo_products_to_delete:
+                # Products used in sales or available in an open POS session cannot be deleted: archive them instead, otherwise this job fails and blocks the rest of the sync
+                try:
+                    with self.env.cr.savepoint():
+                        odoo_product.unlink()
+                    odoo_products_deleted_count += 1
+                except (UserError, psycopg2.IntegrityError) as error:
+                    odoo_product.write({'active': False})
+                    _logger.info(f'Archived Odoo product {odoo_product.name} (Odoo product ID: {odoo_product.id}, WooCommerce product ID: {odoo_product.woocommerce_id}) instead of deleting it: {error}')
+            _logger.info(f'Deleted {odoo_products_deleted_count} Odoo products that were no longer found in WooCommerce, archived {len(odoo_products_to_delete) - odoo_products_deleted_count}.')
 
     @api.model
     def woocommerce_product_fields(
