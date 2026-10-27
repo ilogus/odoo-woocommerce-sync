@@ -1385,13 +1385,21 @@ class WoocommerceSyncConnector(models.Model):
     def woocommerce_order_line_total_to_odoo_price(self: models.Model, woocommerce_line: dict[str, Any], odoo_sale_order_line: models.Model) -> float:
         """Converts a WooCommerce order shipping/fee line 'total' to match the tax convention of the taxes Odoo put on 'odoo_sale_order_line', so both totals agree.
 
-        Like order line items, WooCommerce shipping and fee lines always report 'total' tax-excluded, with their tax in 'total_tax', regardless of the store's 'Prices entered with tax' setting (WooCommerce even converts a tax-included shipping cost to net before storing it) - so the tax is added back when the Odoo line's taxes are tax-included.
+        Like order line items, WooCommerce shipping and fee lines always report 'total' tax-excluded, with their tax in 'total_tax', regardless of the store's 'Prices entered with tax' setting (WooCommerce even converts a tax-included shipping cost to net before storing it) - so the tax is added back when all of the Odoo line's taxes are tax-included.
+
+        Group taxes are evaluated through their child taxes. When the line mixes tax-included and tax-excluded taxes, WooCommerce's single 'total_tax' cannot be split between them, so the net 'total' is kept and a warning is logged.
         """
         total = float(woocommerce_line.get('total') or 0.0)
-        odoo_taxes = odoo_sale_order_line.tax_id if 'tax_id' in odoo_sale_order_line._fields else odoo_sale_order_line.tax_ids
+        odoo_taxes = (odoo_sale_order_line.tax_id if 'tax_id' in odoo_sale_order_line._fields else odoo_sale_order_line.tax_ids).flatten_taxes_hierarchy()
+        odoo_taxes_price_include = odoo_taxes.mapped('price_include')
 
-        if any(odoo_taxes.mapped('price_include')):
+        if odoo_taxes_price_include and all(odoo_taxes_price_include):
             total += float(woocommerce_line.get('total_tax') or 0.0)
+        elif any(odoo_taxes_price_include):
+            _logger.warning(
+                f'WooCommerce line {woocommerce_line.get("id")} on {odoo_sale_order_line.order_id.name} has both tax-included and tax-excluded Odoo taxes ({", ".join(odoo_taxes.mapped("name"))}): '
+                'kept its tax-excluded WooCommerce total, so the Odoo line total may differ from WooCommerce.'
+            )
 
         return odoo_sale_order_line.order_id.currency_id.round(total)
 
@@ -3634,6 +3642,12 @@ class WoocommerceSyncConnector(models.Model):
                                 odoo_customer = self.env['res.partner'].create(customer_values)
                         except psycopg2.errors.UniqueViolation:
                             # A concurrent sync job (e.g. the dedicated customer sync) already created this customer - reuse it instead of failing
+                            # Guests have no WooCommerce ID: match them by guest key, as ('woocommerce_id', '=', False) would match any partner without a WooCommerce ID
+                            identity_domain = []
+                            if customer_values['woocommerce_id']:
+                                identity_domain = ['|', ('woocommerce_id', '=', customer_values['woocommerce_id'])]
+                            elif customer_values.get('woocommerce_guest_key'):
+                                identity_domain = ['|', ('woocommerce_guest_key', '=', customer_values['woocommerce_guest_key'])]
                             odoo_customer = (
                                 self.env['res.partner']
                                 .with_context(active_test=False)
@@ -3641,8 +3655,7 @@ class WoocommerceSyncConnector(models.Model):
                                     [
                                         ('parent_id', '=', False),
                                         ('woocommerce_site_url', '=', self.settings_woocommerce_connection_url),
-                                        '|',
-                                        ('woocommerce_id', '=', customer_values['woocommerce_id']),
+                                        *identity_domain,
                                         ('email', '=ilike', customer_values['email'].strip()),
                                     ],
                                     limit=1,
@@ -3936,7 +3949,7 @@ class WoocommerceSyncConnector(models.Model):
                             raise ValidationError('Cannot replace the WooCommerce delivery line because it has already been invoiced or delivered.')
                         previous_woocommerce_delivery_lines._woocommerce_sync_unlink_stale()
                         odoo_sale_order.carrier_id = odoo_delivery_carrier
-                        odoo_delivery_line = odoo_sale_order._create_delivery_line(odoo_delivery_carrier, first_shipping_line['total'])
+                        odoo_delivery_line = odoo_sale_order._create_delivery_line(odoo_delivery_carrier, float(first_shipping_line.get('total') or 0.0))
                         odoo_delivery_line.write(
                             {
                                 'woocommerce_site_url': self.settings_woocommerce_connection_url,
